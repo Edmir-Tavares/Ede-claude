@@ -5,3 +5,5 @@ __pycache__/
 venv/
 outputs/
 .pytest_cache/
+.env.local
+.env.*.local

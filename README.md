@@ -43,6 +43,19 @@ pip install -r requirements.txt
    python -m higgsfield_app check
    ```
 
+## Exemplo: Seedance 2.5 (texto → vídeo)
+
+`main.py` chama `bytedance/seedance-2.5/text-to-video` com `subscribe` do SDK oficial
+(prompt "A cinematic scene at sunset", 5 s, 720p, 16:9), espera a conclusão e imprime a
+URL do vídeo. Pedidos com status `failed`, `nsfw` ou `canceled` terminam com código 1.
+
+```bash
+# coloque HF_KEY=key-id:key-secret em .env.local (ignorado pelo Git)
+python main.py
+```
+
+As credenciais são lidas de `.env.local` e, se ausentes, de `.env`.
+
 ## 3. Usando pela linha de comando
 
 ```bash

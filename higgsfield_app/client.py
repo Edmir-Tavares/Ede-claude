@@ -13,15 +13,27 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
 import higgsfield_client
 from higgsfield_client import CredentialsMissedError, Status
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# Carrega o .env da raiz do projeto sem sobrescrever variáveis já exportadas.
-load_dotenv(PROJECT_ROOT / '.env', override=False)
+
+def load_env_files() -> None:
+    """Carrega .env.local e depois .env, sem sobrescrever variáveis já definidas.
+
+    Valores vazios são ignorados, para que um `HF_KEY=` em branco no
+    .env.local não esconda uma chave definida em outro lugar.
+    """
+    for name in ('.env.local', '.env'):
+        for key, value in dotenv_values(PROJECT_ROOT / name).items():
+            if value and not os.environ.get(key):
+                os.environ[key] = value
+
+
+load_env_files()
 
 
 def has_credentials() -> bool:
