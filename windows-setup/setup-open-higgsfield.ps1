@@ -55,7 +55,7 @@ $envFile = Join-Path $ProjectDir ".env.local"
 if (-not (Test-Path $envFile)) {
   @(
     "HF_API_BASE_URL=https://api.higgsfield.ai",
-    "OPEN_HIGGSFIELD_READ_WRITE_TOKEN="
+    "OPEN_HIGGSFIELD_READ_WRITE_TOKEN="vercel_blob_rw_7DdBhdkvqcWFCnvO_irUwY7W2eQgiTdaqHsMg6N5ZgX9XJD"
   ) | Set-Content -Path $envFile -Encoding ascii
   Write-Host "Created $envFile" -ForegroundColor Green
 }
