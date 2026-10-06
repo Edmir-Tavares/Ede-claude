@@ -1,9 +1,14 @@
 # Sets up and starts OpenHiggsfield (https://github.com/wide-trace/open-higgsfield) on Windows.
 # Run in PowerShell:  powershell -ExecutionPolicy Bypass -File .\setup-open-higgsfield.ps1
 # Safe to run again: it skips anything already done and never overwrites .env.local.
+# Keep price-and-upload.patch in the same folder as this script: it adds the
+# price shown before Generate and uploads reference files to Higgsfield.
 
 $ErrorActionPreference = "Stop"
 $ProjectDir = Join-Path $HOME "open-higgsfield"
+$Patch = Join-Path $PSScriptRoot "price-and-upload.patch"
+# The upstream commit the patch was written and tested against.
+$BaseCommit = "b16a0ef"
 
 function Refresh-Path {
   $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
@@ -40,27 +45,49 @@ if (-not (Has pnpm) -or -not ((pnpm -v) -like "10.*")) {
 
 Write-Host ("git " + (git --version) + " | node " + (node -v) + " | pnpm " + (pnpm -v)) -ForegroundColor Green
 
-# 4. Clone
+# 4. Clone. Line endings stay as committed so the patch applies byte for byte.
 if (-not (Test-Path (Join-Path $ProjectDir "package.json"))) {
-  git clone https://github.com/wide-trace/open-higgsfield.git $ProjectDir
+  git -c core.autocrlf=false clone https://github.com/wide-trace/open-higgsfield.git $ProjectDir
 }
 Set-Location $ProjectDir
+git config core.autocrlf false
 
-# 5. Dependencies
+# 5. Price preview + Higgsfield uploads
+if (-not (Test-Path $Patch)) { throw "price-and-upload.patch not found next to this script." }
+# Windows PowerShell turns redirected git stderr into a stopping error, so
+# relax that for the one check that is expected to fail on a fresh clone.
+$ErrorActionPreference = "Continue"
+git apply --reverse --check $Patch 2>$null
+$alreadyApplied = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = "Stop"
+if ($alreadyApplied) {
+  Write-Host "Price preview already installed." -ForegroundColor Green
+} else {
+  if (git status --porcelain --untracked-files=no) {
+    throw "The project folder has local edits. Move them aside (git stash) and run this script again."
+  }
+  git checkout -q -B studio $BaseCommit
+  # Rewrite the working files with the committed line endings (a clone made by
+  # the previous version of this script may have converted them).
+  git rm -r -q --cached .
+  git reset -q --hard
+  git apply $Patch
+  if ($LASTEXITCODE -ne 0) { throw "Could not apply price-and-upload.patch." }
+  Write-Host "Price preview installed." -ForegroundColor Green
+}
+
+# 6. Dependencies
 pnpm install --frozen-lockfile
 
-# 6. Local config. HF_API_BASE_URL is Higgsfield's documented API address.
-#    The upload token is left empty for you to fill in yourself.
+# 7. Local config. HF_API_BASE_URL is Higgsfield's documented API address.
+#    Your API key is NOT stored here: you paste it into the app's "API key" box.
 $envFile = Join-Path $ProjectDir ".env.local"
 if (-not (Test-Path $envFile)) {
-  @(
-    "HF_API_BASE_URL=https://api.higgsfield.ai",
-    "OPEN_HIGGSFIELD_READ_WRITE_TOKEN="
-  ) | Set-Content -Path $envFile -Encoding ascii
+  @("HF_API_BASE_URL=https://api.higgsfield.ai") | Set-Content -Path $envFile -Encoding ascii
   Write-Host "Created $envFile" -ForegroundColor Green
 }
 
-# 7. Start and open the browser once the server answers
+# 8. Start and open the browser once the server answers
 Write-Host "Starting http://localhost:3000  (press Ctrl+C in this window to stop)" -ForegroundColor Cyan
 Start-Job -ScriptBlock {
   for ($i = 0; $i -lt 60; $i++) {

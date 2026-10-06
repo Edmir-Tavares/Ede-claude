@@ -1,0 +1,588 @@
+diff --git a/src/app/api/estimate/route.ts b/src/app/api/estimate/route.ts
+new file mode 100644
+index 0000000..42dbd56
+--- /dev/null
++++ b/src/app/api/estimate/route.ts
+@@ -0,0 +1,67 @@
++import { NextResponse } from "next/server";
++
++import { getModel, parseSettings } from "@/generation/catalog";
++import type { GenerationPlane, MediaItem, MediaRole } from "@/generation/catalog/types";
++import { MissingCredentialsError } from "@/generation/credentials";
++import { PlatformError, createPlatformClient } from "@/generation/platform";
++import { readCredentials } from "@/generation/server-credentials";
++import { toPlatform } from "@/generation/to-platform";
++
++/* A route rather than a server action: Next runs a client's server actions one
++   at a time, so a quote refreshed on every keystroke would queue in front of
++   the Generate press it is meant to inform. */
++
++const ROLES: readonly MediaRole[] = ["start", "end", "reference", "video", "audio"];
++
++export async function POST(request: Request): Promise<NextResponse> {
++  let plane: GenerationPlane;
++  try {
++    plane = parsePlane(await request.json());
++  } catch (caught) {
++    return NextResponse.json({ error: messageOf(caught) }, { status: 400 });
++  }
++
++  try {
++    const model = getModel(plane.model);
++    const { path, body } = toPlatform({ ...plane, settings: parseSettings(model, plane.settings) });
++    const estimate = await createPlatformClient(await readCredentials()).estimate(path, body);
++    return NextResponse.json(estimate);
++  } catch (caught) {
++    if (caught instanceof MissingCredentialsError) {
++      return NextResponse.json({ error: "missing-key" }, { status: 401 });
++    }
++    const status = caught instanceof PlatformError && caught.status >= 400 ? caught.status : 500;
++    return NextResponse.json({ error: messageOf(caught) }, { status });
++  }
++}
++
++function parsePlane(data: unknown): GenerationPlane {
++  const value = asRecord(data);
++  if (typeof value.model !== "string") throw new Error("Invalid model");
++  const text = asRecord(value.prompt).text;
++  if (typeof text !== "string") throw new Error("Invalid prompt");
++
++  const media: GenerationPlane["media"] = {};
++  const rawMedia = asRecord(value.media);
++  for (const role of ROLES) {
++    const list = rawMedia[role];
++    if (!Array.isArray(list)) continue;
++    media[role] = list.flatMap((item): MediaItem[] => {
++      const row = asRecord(item);
++      return typeof row.url === "string" && typeof row.id === "string"
++        ? [{ id: row.id, url: row.url, role }]
++        : [];
++    });
++  }
++  return { model: value.model, prompt: { text }, media, settings: asRecord(value.settings) };
++}
++
++function asRecord(value: unknown): Record<string, unknown> {
++  return value !== null && typeof value === "object" && !Array.isArray(value)
++    ? (value as Record<string, unknown>)
++    : {};
++}
++
++function messageOf(caught: unknown): string {
++  return caught instanceof Error ? caught.message : String(caught);
++}
+diff --git a/src/app/api/upload/route.ts b/src/app/api/upload/route.ts
+new file mode 100644
+index 0000000..b160c7b
+--- /dev/null
++++ b/src/app/api/upload/route.ts
+@@ -0,0 +1,62 @@
++import { NextResponse } from "next/server";
++
++import { MissingCredentialsError } from "@/generation/credentials";
++import { createPlatformClient } from "@/generation/platform";
++import { readCredentials } from "@/generation/server-credentials";
++
++/* Inputs go to the generation platform's own storage: one presigned URL per
++   file, filled from here so the browser never needs the key or the storage's
++   CORS rules. The public URL that comes back is what the generate request
++   carries. */
++
++const ALLOWED = new Set([
++  "image/jpeg",
++  "image/jpg",
++  "image/png",
++  "image/webp",
++  "image/gif",
++  "audio/wav",
++  "audio/x-wav",
++  "video/mp4",
++]);
++const MAX_BYTES = 200 * 1024 * 1024;
++
++export async function POST(request: Request): Promise<NextResponse> {
++  const contentType = (request.headers.get("content-type") ?? "").split(";")[0]!.trim().toLowerCase();
++  if (!ALLOWED.has(contentType)) {
++    return NextResponse.json(
++      { error: `Unsupported file type ${contentType || "(none)"}. Use JPEG, PNG, WebP, GIF, MP4 or WAV.` },
++      { status: 415 },
++    );
++  }
++  const declared = Number(request.headers.get("content-length") ?? 0);
++  if (declared > MAX_BYTES) {
++    return NextResponse.json({ error: "File is larger than 200 MB" }, { status: 413 });
++  }
++
++  try {
++    const file = await request.arrayBuffer();
++    if (file.byteLength === 0) return NextResponse.json({ error: "Empty file" }, { status: 400 });
++    if (file.byteLength > MAX_BYTES) {
++      return NextResponse.json({ error: "File is larger than 200 MB" }, { status: 413 });
++    }
++
++    const client = createPlatformClient(await readCredentials());
++    const target = await client.uploadTarget(contentType);
++    const put = await fetch(target.uploadUrl, {
++      method: "PUT",
++      headers: { "Content-Type": contentType, ...target.uploadHeaders },
++      body: file,
++    });
++    if (!put.ok) throw new Error(`Storage refused the file (${put.status})`);
++    console.info("[upload] stored", { contentType, bytes: file.byteLength, url: target.publicUrl });
++    return NextResponse.json({ url: target.publicUrl });
++  } catch (caught) {
++    if (caught instanceof MissingCredentialsError) {
++      return NextResponse.json({ error: "Add your platform key before uploading" }, { status: 401 });
++    }
++    const message = caught instanceof Error ? caught.message : String(caught);
++    console.error("[upload] failed", message);
++    return NextResponse.json({ error: message }, { status: 502 });
++  }
++}
+diff --git a/src/generation/actions.ts b/src/generation/actions.ts
+index ae8eddf..936d1ef 100644
+--- a/src/generation/actions.ts
++++ b/src/generation/actions.ts
+@@ -5,15 +5,14 @@ import { cookies } from "next/headers";
+ import { getModel, parseSettings } from "./catalog";
+ import type { GenerationPlane } from "./catalog/types";
+ import {
+-  MissingCredentialsError,
+   PLATFORM_KEY_COOKIE,
+   PLATFORM_KEY_COOKIE_OPTIONS,
+-  decodeCredentials,
+   encodeCredentials,
+   parseCredentialInput,
+ } from "./credentials";
+ import { createPlatformClient } from "./platform";
+ import type { StatusResult } from "./platform";
++import { readCredentials, readStoredCredentials } from "./server-credentials";
+ import { toPlatform } from "./to-platform";
+ 
+ export async function savePlatformCredentials(data: unknown) {
+@@ -59,19 +58,6 @@ export async function getGenerationStatuses(data: unknown): Promise<StatusResult
+   );
+ }
+ 
+-async function readStoredCredentials() {
+-  const jar = await cookies();
+-  return decodeCredentials(jar.get(PLATFORM_KEY_COOKIE)?.value);
+-}
+-
+-async function readCredentials() {
+-  const stored = await readStoredCredentials();
+-  if (!stored) throw new MissingCredentialsError();
+-  const baseUrl = process.env.HF_API_BASE_URL;
+-  if (!baseUrl) throw new Error("Missing HF_API_BASE_URL");
+-  return { ...stored, baseUrl };
+-}
+-
+ function parseRequestIds(data: unknown): string[] {
+   const payload = asObject(data, "Invalid status payload");
+   const requestIds = payload.requestIds;
+diff --git a/src/generation/platform.ts b/src/generation/platform.ts
+index 13523d7..ba9b065 100644
+--- a/src/generation/platform.ts
++++ b/src/generation/platform.ts
+@@ -35,6 +35,17 @@ export type StatusResult =
+   | { requestId: string; status: GenerationStatus }
+   | { requestId: string; error: string };
+ 
++/** What a request would cost, as the platform quotes it before submit. Both
++    amounts are decimal strings on the wire; they stay strings here so the
++    quote is shown exactly as given. */
++export type Estimate = { credits: string; usd: string };
++
++export type UploadTarget = {
++  publicUrl: string;
++  uploadUrl: string;
++  uploadHeaders: Record<string, string>;
++};
++
+ export type PlatformClientOptions = {
+   apiKey: string;
+   baseUrl: string;
+@@ -73,6 +84,15 @@ export function createPlatformClient(options: PlatformClientOptions) {
+       if (!isModelId(model)) throw new PlatformError(400, { detail: "Invalid model" });
+       return mapQueued(await send("POST", `/${model}`, input));
+     },
++    async estimate(model: string, input: Record<string, unknown>): Promise<Estimate> {
++      if (!isModelId(model)) throw new PlatformError(400, { detail: "Invalid model" });
++      return mapEstimate(await send("POST", `/estimate/${model}`, input));
++    },
++    async uploadTarget(contentType: string): Promise<UploadTarget> {
++      return mapUploadTarget(
++        await send("POST", "/files/generate-upload-url", { content_type: contentType }),
++      );
++    },
+     async status(requestId: string): Promise<GenerationStatus> {
+       if (!requestId) throw new PlatformError(400, { detail: "Missing request id" });
+       return mapStatus(await send("GET", `/requests/${encodeURIComponent(requestId)}/status`));
+@@ -92,6 +112,30 @@ function mapQueued(payload: unknown): QueuedGeneration {
+   };
+ }
+ 
++function mapEstimate(payload: unknown): Estimate {
++  const data = asRecord(payload);
++  const credits = numericField(data, "credits");
++  const usd = numericField(data, "usd");
++  if (credits === undefined || usd === undefined) {
++    throw new PlatformError(502, { detail: "Platform estimate missing credits or usd" });
++  }
++  return { credits, usd };
++}
++
++function mapUploadTarget(payload: unknown): UploadTarget {
++  const data = asRecord(payload);
++  const publicUrl = stringField(data, "public_url");
++  const uploadUrl = stringField(data, "upload_url");
++  if (!publicUrl || !uploadUrl) {
++    throw new PlatformError(502, { detail: "Platform upload response missing URLs" });
++  }
++  const uploadHeaders: Record<string, string> = {};
++  for (const [key, value] of Object.entries(asRecord(data.upload_headers))) {
++    if (typeof value === "string") uploadHeaders[key] = value;
++  }
++  return { publicUrl, uploadUrl, uploadHeaders };
++}
++
+ function mapStatus(payload: unknown): GenerationStatus {
+   const data = asRecord(payload);
+   const requestId = stringField(data, "request_id") ?? "";
+@@ -123,6 +167,14 @@ function stringField(value: Record<string, unknown>, key: string): string | unde
+   return typeof field === "string" ? field : undefined;
+ }
+ 
++function numericField(value: Record<string, unknown>, key: string): string | undefined {
++  const field = value[key];
++  if (typeof field === "number" && Number.isFinite(field)) return String(field);
++  return typeof field === "string" && field.trim() && Number.isFinite(Number(field))
++    ? field
++    : undefined;
++}
++
+ async function readJson(response: Response): Promise<unknown> {
+   const text = await response.text();
+   if (!text) return null;
+diff --git a/src/generation/server-credentials.ts b/src/generation/server-credentials.ts
+new file mode 100644
+index 0000000..c580721
+--- /dev/null
++++ b/src/generation/server-credentials.ts
+@@ -0,0 +1,20 @@
++import { cookies } from "next/headers";
++
++import { MissingCredentialsError, PLATFORM_KEY_COOKIE, decodeCredentials } from "./credentials";
++
++/* Shared by the server actions and the route handlers. It lives outside
++   actions.ts because every export of a "use server" module is callable from
++   the browser, and the key must never be. */
++
++export async function readStoredCredentials() {
++  const jar = await cookies();
++  return decodeCredentials(jar.get(PLATFORM_KEY_COOKIE)?.value);
++}
++
++export async function readCredentials() {
++  const stored = await readStoredCredentials();
++  if (!stored) throw new MissingCredentialsError();
++  const baseUrl = process.env.HF_API_BASE_URL;
++  if (!baseUrl) throw new Error("Missing HF_API_BASE_URL");
++  return { ...stored, baseUrl };
++}
+diff --git a/src/generation/upload.ts b/src/generation/upload.ts
+index 81024da..aaefdbb 100644
+--- a/src/generation/upload.ts
++++ b/src/generation/upload.ts
+@@ -1,22 +1,12 @@
+-import { put } from "@vercel/blob/client";
+-
+ export async function uploadMedia(file: File): Promise<{ url: string }> {
+-  const res = await fetch("/api/blob", {
++  const res = await fetch("/api/upload", {
+     method: "POST",
+-    headers: { "content-type": "application/json" },
+-    body: JSON.stringify({
+-      type: "blob.generate-client-token",
+-      payload: { pathname: file.name, clientPayload: null, multipart: false },
+-    }),
++    headers: { "content-type": file.type || "application/octet-stream" },
++    body: file,
+   });
+-  if (!res.ok) throw new Error("Failed to retrieve the client token");
+-  const { clientToken, pathname } = (await res.json()) as {
+-    clientToken?: unknown;
+-    pathname?: unknown;
+-  };
+-  if (typeof clientToken !== "string" || typeof pathname !== "string") {
+-    throw new Error("Failed to retrieve the client token");
++  const payload = (await res.json().catch(() => null)) as { url?: unknown; error?: unknown } | null;
++  if (!res.ok || typeof payload?.url !== "string") {
++    throw new Error(typeof payload?.error === "string" ? payload.error : `Upload failed (${res.status})`);
+   }
+-  const blob = await put(pathname, file, { access: "public", token: clientToken });
+-  return { url: blob.url };
++  return { url: payload.url };
+ }
+diff --git a/src/openhiggsfield/composer.tsx b/src/openhiggsfield/composer.tsx
+index 060edc2..c15b873 100644
+--- a/src/openhiggsfield/composer.tsx
++++ b/src/openhiggsfield/composer.tsx
+@@ -17,6 +17,7 @@ import { ArrowUpIcon, CaretDownIcon, CloseIcon, MinusIcon, PlusIcon, WarningIcon
+ import { MediaStrip, useMediaTray } from "./media-tray";
+ import { ModelIcon, modelIconSrc } from "./model-icon";
+ import { ModelPicker } from "./model-picker";
++import { PriceTag } from "./price";
+ import { SettingPill, SettingPopover } from "./settings";
+ 
+ /* Overlay ids: the two fixed panels, or one setting addressed by its catalog
+@@ -55,6 +56,7 @@ export function Composer({
+   notice,
+   selection,
+   selecting,
++  keyConfigured,
+   onError,
+   onGenerate,
+ }: {
+@@ -73,6 +75,8 @@ export function Composer({
+      always mounted so it can animate away, and states its own presence. */
+   selection: ReactNode;
+   selecting: boolean;
++  /* The price quote needs the key; it re-asks the moment one is saved. */
++  keyConfigured: boolean;
+   onError: (message: string | null) => void;
+   onGenerate: () => void;
+ }) {
+@@ -362,7 +366,9 @@ export function Composer({
+                 <BatchStepper value={batchValue} counts={counts} onChange={setBatchValue} />
+               </div>
+ 
+-              <span className="ohf-generate-slot ohf-tip ohf-tip--end" data-tip={generateTip}>
++              <span className="ohf-generate-slot">
++                <PriceTag requests={native ? 1 : batchValue} keyConfigured={keyConfigured} />
++                <span className="ohf-generate-hold ohf-tip ohf-tip--end" data-tip={generateTip}>
+                 <button
+                   type="button"
+                   className="ohf-generate"
+@@ -381,6 +387,7 @@ export function Composer({
+                   <span className="ohf-generate-label">Generate</span>
+                   {shortcut && <kbd className="ohf-kbd">{shortcut}</kbd>}
+                 </button>
++                </span>
+               </span>
+             </div>
+           </div>
+diff --git a/src/openhiggsfield/media-tray.tsx b/src/openhiggsfield/media-tray.tsx
+index c19c264..8c3f91b 100644
+--- a/src/openhiggsfield/media-tray.tsx
++++ b/src/openhiggsfield/media-tray.tsx
+@@ -101,7 +101,7 @@ export function useMediaTray(
+     } catch (caught) {
+       onError(
+         caught instanceof Error
+-          ? `Upload failed — ${caught.message}. Check the Blob store is configured, then retry.`
++          ? `Upload failed — ${caught.message}. Check your platform key, then retry.`
+           : "Upload failed. Retry, or drop the file and generate from the prompt alone.",
+       );
+     } finally {
+diff --git a/src/openhiggsfield/openhiggsfield-app.tsx b/src/openhiggsfield/openhiggsfield-app.tsx
+index 1b12874..95d352c 100644
+--- a/src/openhiggsfield/openhiggsfield-app.tsx
++++ b/src/openhiggsfield/openhiggsfield-app.tsx
+@@ -667,6 +667,7 @@ export function OpenHiggsfieldApp({ fontClassName = "" }: { fontClassName?: stri
+                 onClose={clearPicked}
+               />
+             }
++            keyConfigured={keyConfigured}
+             onError={setError}
+             onGenerate={runGenerate}
+             notice={
+diff --git a/src/openhiggsfield/openhiggsfield.css b/src/openhiggsfield/openhiggsfield.css
+index 3416e87..e76f33f 100644
+--- a/src/openhiggsfield/openhiggsfield.css
++++ b/src/openhiggsfield/openhiggsfield.css
+@@ -1911,6 +1911,38 @@
+   flex-shrink: 0;
+   display: flex;
+ }
++.ohf-generate-hold {
++  display: flex;
++}
++/* The quote sits beside the press it prices. Data, not decoration: neutral
++   ink and tabular numerals; only an unavailable quote takes a colour. */
++.ohf-price {
++  align-self: center;
++  margin-right: 10px;
++  display: flex;
++  flex-direction: column;
++  align-items: flex-end;
++  gap: 1px;
++  font-size: 12px;
++  line-height: 1.25;
++  font-variant-numeric: tabular-nums;
++  color: var(--tx4);
++  white-space: nowrap;
++}
++.ohf-price[data-state="loading"] {
++  color: var(--tx3);
++}
++.ohf-price[data-state="error"] {
++  color: var(--danger);
++}
++.ohf-price-usd {
++  font-size: 14px;
++  font-weight: 600;
++  color: var(--tx);
++}
++.ohf-price-credits {
++  color: var(--tx3);
++}
+ .ohf-generate {
+   height: 38px;
+   border-radius: var(--ctl-r);
+@@ -3657,6 +3689,9 @@ a.ohf-btn-solid {
+     width: 100%;
+     margin-left: 0;
+   }
++  .ohf-generate-hold {
++    flex: 1 1 auto;
++  }
+   .ohf-generate {
+     width: 100%;
+     height: 44px;
+diff --git a/src/openhiggsfield/price.tsx b/src/openhiggsfield/price.tsx
+new file mode 100644
+index 0000000..f273c81
+--- /dev/null
++++ b/src/openhiggsfield/price.tsx
+@@ -0,0 +1,130 @@
++"use client";
++
++import { useEffect, useState } from "react";
++
++import { assemblePlane } from "@/generation/plane";
++import { useActive } from "@/generation/stores/active";
++import { useImageMedia, useVideoMedia } from "@/generation/stores/media";
++import { useImagePrompt, useVideoPrompt } from "@/generation/stores/prompt";
++import { useSettings } from "@/generation/stores/settings";
++
++type Quote = { credits: string; usd: string };
++type PriceState =
++  | { kind: "idle"; text: string }
++  | { kind: "loading" }
++  | { kind: "ready"; quote: Quote }
++  | { kind: "error"; text: string; detail: string };
++
++/* A quote waits for typing to settle: the platform prices the whole request,
++   prompt included, and a call per keystroke would only be thrown away. */
++const SETTLE_MS = 550;
++
++/** What pressing Generate will cost, quoted by the platform for exactly the
++    request the press would send. `requests` is how many times that request
++    goes out — a studio-side batch is several identical submits. */
++export function PriceTag({ requests, keyConfigured }: { requests: number; keyConfigured: boolean }) {
++  const surface = useActive((state) => state.surface);
++  const modelId = useActive((state) => state.model);
++  const text = (surface === "image" ? useImagePrompt : useVideoPrompt)((state) => state.text);
++  const items = (surface === "image" ? useImageMedia : useVideoMedia)((state) => state.items);
++  const byModel = useSettings((state) => state.byModel[modelId]);
++  const [state, setState] = useState<PriceState>({ kind: "idle", text: "" });
++
++  const mediaKey = items.map((item) => `${item.role}:${item.url}`).join("|");
++  const settingsKey = JSON.stringify(byModel ?? {});
++
++  useEffect(() => {
++    if (!keyConfigured) {
++      setState({ kind: "idle", text: "Add your key to see the price" });
++      return;
++    }
++    if (!text.trim()) {
++      setState({ kind: "idle", text: "Write a prompt to see the price" });
++      return;
++    }
++    if (items.some((item) => item.url.startsWith("blob:"))) {
++      setState({ kind: "idle", text: "Waiting for the upload…" });
++      return;
++    }
++
++    const controller = new AbortController();
++    setState({ kind: "loading" });
++    const timer = window.setTimeout(async () => {
++      try {
++        const res = await fetch("/api/estimate", {
++          method: "POST",
++          headers: { "content-type": "application/json" },
++          body: JSON.stringify(assemblePlane()),
++          signal: controller.signal,
++        });
++        const payload = (await res.json().catch(() => null)) as
++          | (Partial<Quote> & { error?: unknown })
++          | null;
++        if (res.status === 401) {
++          setState({ kind: "idle", text: "Add your key to see the price" });
++          return;
++        }
++        if (!res.ok || typeof payload?.usd !== "string" || typeof payload.credits !== "string") {
++          const detail = typeof payload?.error === "string" ? payload.error : `HTTP ${res.status}`;
++          setState({ kind: "error", text: "Price unavailable", detail });
++          return;
++        }
++        setState({ kind: "ready", quote: { credits: payload.credits, usd: payload.usd } });
++      } catch (caught) {
++        if (controller.signal.aborted) return;
++        const detail = caught instanceof Error ? caught.message : String(caught);
++        setState({ kind: "error", text: "Price unavailable", detail });
++      }
++    }, SETTLE_MS);
++
++    return () => {
++      controller.abort();
++      window.clearTimeout(timer);
++    };
++    // The keys stand in for the arrays and objects they summarise.
++  }, [keyConfigured, modelId, text, mediaKey, settingsKey]);
++
++  if (state.kind === "loading") {
++    return (
++      <span className="ohf-price" data-state="loading" aria-live="polite">
++        Pricing…
++      </span>
++    );
++  }
++  if (state.kind === "idle") {
++    return state.text ? (
++      <span className="ohf-price" data-state="idle">
++        {state.text}
++      </span>
++    ) : null;
++  }
++  if (state.kind === "error") {
++    return (
++      <span className="ohf-price ohf-tip" data-state="error" data-tip={state.detail}>
++        {state.text}
++      </span>
++    );
++  }
++
++  const { usd, credits } = totals(state.quote, requests);
++  const each = requests > 1 ? ` (${requests} × $${state.quote.usd})` : "";
++  return (
++    <span
++      className="ohf-price"
++      data-state="ready"
++      aria-live="polite"
++      title={`Platform estimate for this exact request${each}. Failed and moderated runs are not charged.`}
++    >
++      <span className="ohf-price-usd">${usd}</span>
++      <span className="ohf-price-credits">{credits} credits</span>
++    </span>
++  );
++}
++
++/* The quote is per request. Multiplying in whole thousandths keeps a sum like
++   3 × 0.094 from printing as 0.28200000000000003. */
++function totals(quote: Quote, requests: number) {
++  if (requests <= 1) return { usd: quote.usd, credits: quote.credits };
++  const scale = (value: string) => ((Math.round(Number(value) * 1000) * requests) / 1000).toFixed(3);
++  return { usd: scale(quote.usd), credits: scale(quote.credits) };
++}
