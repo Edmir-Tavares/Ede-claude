@@ -140,7 +140,7 @@ index 0000000..b160c7b
 +  }
 +}
 diff --git a/src/generation/actions.ts b/src/generation/actions.ts
-index ae8eddf..936d1ef 100644
+index ae8eddf..27ddb7d 100644
 --- a/src/generation/actions.ts
 +++ b/src/generation/actions.ts
 @@ -5,15 +5,14 @@ import { cookies } from "next/headers";
@@ -155,12 +155,63 @@ index ae8eddf..936d1ef 100644
    parseCredentialInput,
  } from "./credentials";
  import { createPlatformClient } from "./platform";
- import type { StatusResult } from "./platform";
+-import type { StatusResult } from "./platform";
++import type { QueuedGeneration, StatusResult } from "./platform";
 +import { readCredentials, readStoredCredentials } from "./server-credentials";
  import { toPlatform } from "./to-platform";
  
  export async function savePlatformCredentials(data: unknown) {
-@@ -59,19 +58,6 @@ export async function getGenerationStatuses(data: unknown): Promise<StatusResult
+@@ -31,14 +30,24 @@ export async function hasPlatformCredentials() {
+   return (await readStoredCredentials()) !== null;
+ }
+ 
+-export async function submitGeneration(plane: GenerationPlane) {
+-  const model = getModel(plane.model);
+-  const parsed: GenerationPlane = {
+-    ...plane,
+-    settings: parseSettings(model, plane.settings),
+-  };
+-  const { path, body } = toPlatform(parsed);
+-  return createPlatformClient(await readCredentials()).submit(path, body);
++/** A failed submit comes back as a value, not a throw: a production build
++    replaces every message thrown from a server action with a generic React
++    error, and the visitor needs the platform's own reason (a bad key, no
++    balance, a rejected setting) to act on it. */
++export async function submitGeneration(
++  plane: GenerationPlane,
++): Promise<{ queued: QueuedGeneration } | { error: string }> {
++  try {
++    const model = getModel(plane.model);
++    const parsed: GenerationPlane = {
++      ...plane,
++      settings: parseSettings(model, plane.settings),
++    };
++    const { path, body } = toPlatform(parsed);
++    return { queued: await createPlatformClient(await readCredentials()).submit(path, body) };
++  } catch (caught) {
++    return { error: caught instanceof Error ? caught.message : String(caught) };
++  }
+ }
+ 
+ /** Every request in flight, answered in one round trip. Next dispatches server
+@@ -47,7 +56,15 @@ export async function submitGeneration(plane: GenerationPlane) {
+     genuinely parallel. */
+ export async function getGenerationStatuses(data: unknown): Promise<StatusResult[]> {
+   const requestIds = parseRequestIds(data);
+-  const client = createPlatformClient(await readCredentials());
++  let client: ReturnType<typeof createPlatformClient>;
++  try {
++    client = createPlatformClient(await readCredentials());
++  } catch (caught) {
++    /* Same reason as submit: answer every request with the message rather
++       than throw it into a production build that would hide it. */
++    const error = caught instanceof Error ? caught.message : String(caught);
++    return requestIds.map((requestId) => ({ requestId, error }));
++  }
+   return Promise.all(
+     requestIds.map(async (requestId): Promise<StatusResult> => {
+       try {
+@@ -59,19 +76,6 @@ export async function getGenerationStatuses(data: unknown): Promise<StatusResult
    );
  }
  
@@ -386,10 +437,21 @@ index c19c264..8c3f91b 100644
        );
      } finally {
 diff --git a/src/openhiggsfield/openhiggsfield-app.tsx b/src/openhiggsfield/openhiggsfield-app.tsx
-index 1b12874..95d352c 100644
+index 1b12874..dc7bc48 100644
 --- a/src/openhiggsfield/openhiggsfield-app.tsx
 +++ b/src/openhiggsfield/openhiggsfield-app.tsx
-@@ -667,6 +667,7 @@ export function OpenHiggsfieldApp({ fontClassName = "" }: { fontClassName?: stri
+@@ -379,7 +379,9 @@ export function OpenHiggsfieldApp({ fontClassName = "" }: { fontClassName?: stri
+ 
+     const runOne = async (slot: { skeletons: string[] }) => {
+       try {
+-        const queued = await submitGeneration(plane);
++        const submitted = await submitGeneration(plane);
++        if ("error" in submitted) throw new Error(submitted.error);
++        const { queued } = submitted;
+         setHistory((prev) => {
+           const next = [...runningRows(queued.requestId, slot.skeletons.length, draft), ...prev];
+           void saveHistory(next);
+@@ -667,6 +669,7 @@ export function OpenHiggsfieldApp({ fontClassName = "" }: { fontClassName?: stri
                  onClose={clearPicked}
                />
              }

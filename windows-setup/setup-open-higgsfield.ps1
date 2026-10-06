@@ -63,14 +63,26 @@ $ErrorActionPreference = "Stop"
 if ($alreadyApplied) {
   Write-Host "Price preview already installed." -ForegroundColor Green
 } else {
-  if (git status --porcelain --untracked-files=no) {
-    throw "The project folder has local edits. Move them aside (git stash) and run this script again."
+  # Edits inside the files this patch owns are an older copy of it and are
+  # replaced; an edit anywhere else is the user's own work and is kept.
+  $patchFiles = @(Select-String -Path $Patch -Pattern '^diff --git a/(\S+) b/' |
+    ForEach-Object { $_.Matches[0].Groups[1].Value })
+  $dirty = @(git status --porcelain --untracked-files=no | ForEach-Object { $_.Substring(3) })
+  $foreign = @($dirty | Where-Object { $patchFiles -notcontains $_ })
+  if ($foreign.Count -gt 0) {
+    throw ("The project folder has your own edits in: " + ($foreign -join ", ") +
+      ". Move them aside (git stash) and run this script again.")
   }
   git checkout -q -B studio $BaseCommit
   # Rewrite the working files with the committed line endings (a clone made by
-  # the previous version of this script may have converted them).
+  # the first version of this script may have converted them).
   git rm -r -q --cached .
   git reset -q --hard
+  # Files an older copy of the patch created are not tracked, so the reset
+  # leaves them; clear them so this copy can create them again.
+  foreach ($file in $patchFiles) {
+    if (-not (git ls-files -- $file) -and (Test-Path $file)) { Remove-Item $file }
+  }
   git apply $Patch
   if ($LASTEXITCODE -ne 0) { throw "Could not apply price-and-upload.patch." }
   Write-Host "Price preview installed." -ForegroundColor Green
